@@ -7,6 +7,8 @@
 
 #include <pcap/pcap.h>
 
+#define SNAP_LEN 65536
+
 enum {
     IENONE,                 // No error
     IENEWCXT,               // Unable to malloc
@@ -14,9 +16,13 @@ enum {
 };
 
 typedef struct {
-    pcap_t *phdl;
+    pcap_t *ihdl;
+    pcap_t *ehdl;
     char *bpf;
-    char *igr_device;
+    char *idev;
+    char *edev;
+    int icnt;
+    int ecnt;
 } ctx_t;
 
 int ierrno;
@@ -96,73 +102,91 @@ static void process_packet(u_char *user, const struct pcap_pkthdr *h, const u_ch
     //fflush(stdout);
 #endif
 
-    *(int *)user += 1;
+    ctx_t *ctx = (ctx_t *)user;
+    ctx->icnt += 1;
+
+    if (pcap_sendpacket(ctx->ehdl, bytes, h->len) != 0) {
+        pcap_perror(ctx->ehdl, NULL);
+        return;
+    }
+    ctx->ecnt += 1;
 }
 
 void sig_handler(int sig)
 {
-    pcap_breakloop(ctx->phdl);
+    pcap_breakloop(ctx->ihdl);
+}
+
+int setup_pcap(ctx_t *ctx)
+{
+    return 0;
 }
 
 static int run(ctx_t *ctx)
 {
-    int count = 0;
-
     char errbuf[PCAP_ERRBUF_SIZE];
     bpf_u_int32 net, mask;
     struct bpf_program bpf;
 
     signal(SIGINT, sig_handler);
 
-    ctx->phdl = pcap_open_live(ctx->igr_device, 2048, 1, 1000, errbuf);
-    if (!ctx->phdl) {
+    ctx->ehdl = pcap_open_live(ctx->edev, SNAP_LEN, 1, 1000, errbuf);
+    if (!ctx->ehdl) {
         fprintf(stderr, "%s\n", errbuf);
         return -1;
     }
 
-    if (pcap_lookupnet(ctx->igr_device, &net, &mask, errbuf) == -1) {
+    ctx->ihdl = pcap_open_live(ctx->idev, SNAP_LEN, 1, 1000, errbuf);
+    if (!ctx->ihdl) {
         fprintf(stderr, "%s\n", errbuf);
         return -1;
     }
 
-    //if (pcap_compile(ctx->phdl, &bpf, "udp dst port 5201", 0, net) == -1) {
-    if (pcap_compile(ctx->phdl, &bpf, ctx->bpf, 0, net) == -1) {
-        pcap_perror(ctx->phdl, NULL);
+    if (pcap_lookupnet(ctx->idev, &net, &mask, errbuf) == -1) {
+        fprintf(stderr, "%s\n", errbuf);
         return -1;
     }
 
-    if (pcap_setfilter(ctx->phdl, &bpf) == -1) {
-        pcap_perror(ctx->phdl, NULL);
+    if (pcap_compile(ctx->ihdl, &bpf, ctx->bpf, 0, net) == -1) {
+        pcap_perror(ctx->ihdl, NULL);
         return -1;
     }
 
-    if (pcap_loop(ctx->phdl, -1, process_packet, (u_char *)&count) == -1) {
-        pcap_perror(ctx->phdl, NULL);
+    if (pcap_setfilter(ctx->ihdl, &bpf) == -1) {
+        pcap_perror(ctx->ihdl, NULL);
+        return -1;
+    }
+
+    if (pcap_loop(ctx->ihdl, -1, process_packet, (u_char *)ctx) == -1) {
+        pcap_perror(ctx->ihdl, NULL);
         return -1;
     }
 
     fprintf(stdout, "\n");
-    fprintf(stdout, "%d packets captured\n", count);
+    fprintf(stdout, "ingress %d packets captured\n", ctx->icnt);
+    fprintf(stdout, "egress %d packets sent\n", ctx->ecnt);
 
-    pcap_close(ctx->phdl);
-
+    pcap_close(ctx->ihdl);
     return 0;
 }
 
 static void usage(const char *bin)
 {
     fprintf(stderr, "version 0.1, %s %s\n", __DATE__, __TIME__);
-    fprintf(stderr, "Usage: %s [-i <ingress device>] [-f 'arp'] [-h]\n", bin);
+    fprintf(stderr, "Usage: %s [-h] [-i <ingress device>] [-e <egress device>] [-f 'udp dst port 5201']\n", bin);
 }
 
 static int parse_arguments(ctx_t *ctx, int argc, char **argv)
 {
     int flag;
 
-    while ((flag = getopt(argc, argv, "hi:f:")) != -1) {
+    while ((flag = getopt(argc, argv, "hi:e:f:")) != -1) {
         switch (flag) {
             case 'i':
-                ctx->igr_device = strdup(optarg);
+                ctx->idev = strdup(optarg);
+                break;
+            case 'e':
+                ctx->edev = strdup(optarg);
                 break;
             case 'f':
                 ctx->bpf = strdup(optarg);
@@ -173,7 +197,7 @@ static int parse_arguments(ctx_t *ctx, int argc, char **argv)
         }
     }
 
-    //fprintf(stdout, "set igr_device '%s', bpf '%s'\n", ctx->igr_device, ctx->bpf);
+    //fprintf(stdout, "set idev '%s', bpf '%s'\n", ctx->idev, ctx->bpf);
     return 0;
 }
 
