@@ -486,7 +486,7 @@ static int parse_arguments(ctx_t *ctx, int argc, char **argv)
                 }
                 break;
             }
-            case 'e': {
+            case 'o': {
                 for (i = optind - 1; i < argc && argv[i][0] != '-'; i++) {
                     struct dev_out_st *elmo = (struct dev_out_st *)malloc(sizeof(struct dev_out_st));
                     if (!elmo) {
