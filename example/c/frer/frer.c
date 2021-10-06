@@ -9,10 +9,77 @@
 #include <pcap/pcap.h>
 #include <linux/if_ether.h>
 
-#include "list.h"
-#include "get_mac.h"
+#define SLIST_HEAD(name, type)						\
+struct name {								\
+	struct type *slh_first;	/* first element */			\
+}
+ 
+#define	SLIST_HEAD_INITIALIZER(head)					\
+	{ NULL }
+ 
+#define SLIST_ENTRY(type)						\
+struct {								\
+	struct type *sle_next;	/* next element */			\
+}
+ 
+/*
+ * Singly-linked List access methods.
+ */
+#define	SLIST_FIRST(head)	((head)->slh_first)
+#define	SLIST_END(head)		NULL
+#define	SLIST_EMPTY(head)	(SLIST_FIRST(head) == SLIST_END(head))
+#define	SLIST_NEXT(elm, field)	((elm)->field.sle_next)
 
-#define TIMEOUT 512
+#define	SLIST_FOREACH(var, head, field)					\
+	for((var) = SLIST_FIRST(head);					\
+	    (var) != SLIST_END(head);					\
+	    (var) = SLIST_NEXT(var, field))
+
+#define	SLIST_FOREACH_PREVPTR(var, varp, head, field)			\
+	for ((varp) = &SLIST_FIRST((head));				\
+	    ((var) = *(varp)) != SLIST_END(head);			\
+	    (varp) = &SLIST_NEXT((var), field))
+
+/*
+ * Singly-linked List functions.
+ */
+#define	SLIST_INIT(head) {						\
+	SLIST_FIRST(head) = SLIST_END(head);				\
+}
+
+#define	SLIST_INSERT_AFTER(slistelm, elm, field) do {			\
+	(elm)->field.sle_next = (slistelm)->field.sle_next;		\
+	(slistelm)->field.sle_next = (elm);				\
+} while (0)
+
+#define	SLIST_INSERT_HEAD(head, elm, field) do {			\
+	(elm)->field.sle_next = (head)->slh_first;			\
+	(head)->slh_first = (elm);					\
+} while (0)
+
+#define	SLIST_REMOVE_NEXT(head, elm, field) do {			\
+	(elm)->field.sle_next = (elm)->field.sle_next->field.sle_next;	\
+} while (0)
+
+#define	SLIST_REMOVE_HEAD(head, field) do {				\
+	(head)->slh_first = (head)->slh_first->field.sle_next;		\
+} while (0)
+
+#define SLIST_REMOVE(head, elm, type, field) do {			\
+	if ((head)->slh_first == (elm)) {				\
+		SLIST_REMOVE_HEAD((head), field);			\
+	} else {							\
+		struct type *curelm = (head)->slh_first;		\
+									\
+		while (curelm->field.sle_next != (elm))			\
+			curelm = curelm->field.sle_next;		\
+		curelm->field.sle_next =				\
+		    curelm->field.sle_next->field.sle_next;		\
+		_Q_INVALIDATE((elm)->field.sle_next);			\
+	}								\
+} while (0)
+
+#define TIMEOUT 100 /* ms */
 #define FRER_HLEN 20
 #define ETH_P_8021CB 0xF1C1
 
@@ -20,7 +87,7 @@
 #define BITMAP_RESET(POS) (bitmap[POS/8] &= ~(1 << (POS%8)))
 #define BITMAP_TEST(POS) ((bitmap[POS/8] >> (POS%8) & 0x01) == 1)
 
-#define SHORTOPTS "hdi:e:f:tl"
+#define SHORTOPTS "hdi:o:f:m:tl"
 
 struct rtag_st {
     unsigned short rsvd;
@@ -28,48 +95,83 @@ struct rtag_st {
     unsigned short type;
 };
 
-struct dev_attr_st {
+struct dev_out_st {
+    SLIST_ENTRY(dev_out_st) le;
+    unsigned char dest[ETH_ALEN];
+    unsigned char source[ETH_ALEN];
     char *dev;
     pcap_t *pcap_hdl;
     int cnt;
 };
 
-struct dev_out_st {
-    SLIST_ENTRY(dev_out_st) le;
-
-    struct dev_attr_st devatt;
-    unsigned char dest[ETH_ALEN];
-    unsigned char source[ETH_ALEN];
-};
-
 struct dev_in_st {
-    char *bpf;
-    int promisc;
-    struct dev_attr_st devatt;
+    SLIST_ENTRY(dev_in_st) le;
+    char *dev;
+    pcap_t *pcap_hdl;
+    int cnt;
 };
 
 typedef struct {
     char role;
-    struct dev_in_st devi;
-    SLIST_HEAD(head_st, dev_out_st) devolh;
+    int debug;
+    char *bpf;
+    int promisc;
+    SLIST_HEAD(header_in_st, dev_in_st) devilh;
+    SLIST_HEAD(header_out_st, dev_out_st) devolh;
     pcap_handler callback;
 } ctx_t;
 
 static ctx_t *ctx;
+static int sig_exit;
 static unsigned short sequence_number;
 static unsigned char bitmap[64*1024/8];
 static unsigned short window_pos = 0;
 
+#define SHORTOPTS "hdi:o:f:m:tl"
 static const struct option longopts[] = {
     { "help", no_argument, NULL, 'h' },
     { "debug", no_argument, NULL, 'd' },
-    { "ingress-interface", required_argument, NULL, 'i' },
-    { "egress-interface", required_argument, NULL, 'e' },
+    { "in-interface", required_argument, NULL, 'i' },
+    { "out-interface", required_argument, NULL, 'o' },
     { "packet-filter", required_argument, NULL, 'f' },
+	{ "promisc", required_argument, NULL, 'm' },
 	{ "frer-talker", no_argument, NULL, 't' },
 	{ "frer-listener", no_argument, NULL, 'l' },
 	{ 0, 0, 0, 0 },
 };
+
+static int get_mac_address(char *dev, unsigned char *dest, unsigned char *source)
+{
+    unsigned char dmac1[ETH_ALEN] = {0x00,0x0c,0x29,0x9b,0x35,0x0d};
+    unsigned char dmac2[ETH_ALEN] = {0x00,0x0c,0x29,0x9b,0x35,0x17};
+    unsigned char smac[ETH_ALEN] = {0x09, 0x08, 0x07, 0x06, 0x05, 0x04};
+
+    if (strcmp(dev, "eth1") == 0)
+        memcpy(dest, dmac1, ETH_ALEN);
+    if (strcmp(dev, "eth2") == 0)
+        memcpy(dest, dmac2, ETH_ALEN);
+    memcpy(source, smac, ETH_ALEN);
+
+    return 0;
+}
+
+static char *hexdump(const unsigned char *buffer, int len)
+{
+    int i = 0, j = 0;
+    static char str[BUFSIZ];
+
+    if (len > BUFSIZ/3)
+        return "";
+
+    memset(str, '\0', BUFSIZ);
+    for (; i < len; i++) {
+        sprintf(&str[j], " %02X", buffer[i]);
+        j += 3;
+    }
+    sprintf(&str[j], " ");
+
+    return str;
+}
 
 /* Whenever the sequence increases by 16k, clear the first 8k */
 static void frer_recover_sequence(unsigned short pos)
@@ -87,94 +189,91 @@ static void frer_recover_sequence(unsigned short pos)
 
 void sig_handler(int sig)
 {
-    if (ctx->devi.devatt.pcap_hdl)
-        pcap_breakloop(ctx->devi.devatt.pcap_hdl);
-}
+    struct dev_in_st *elmi;                                                          
 
-int frer_create_pcap_in(ctx_t *ctx)
-{
-    char errbuf[PCAP_ERRBUF_SIZE];
-    bpf_u_int32 net, mask;
-    struct bpf_program bp;
-    pcap_t *pcap_hdl;
-
-    pcap_hdl = pcap_open_live(ctx->devi.devatt.dev, BUFSIZ, ctx->devi.promisc, TIMEOUT, errbuf);
-    if (!pcap_hdl) {
-        fprintf(stderr, "%s\n", errbuf);
-        goto error;
-    }
-    ctx->devi.devatt.pcap_hdl = pcap_hdl;
-
-    if (pcap_setdirection(pcap_hdl, PCAP_D_IN) != 0) {
-        pcap_perror(pcap_hdl, NULL);
-        goto error;
+    SLIST_FOREACH(elmi, &ctx->devilh, le) {
+        if (elmi->pcap_hdl)
+            pcap_breakloop(elmi->pcap_hdl);
     }
 
-    if (!ctx->devi.bpf)
-        return 0;
-
-    if (pcap_lookupnet(ctx->devi.devatt.dev, &net, &mask, errbuf) == -1) {
-        fprintf(stderr, "%s\n", errbuf);
-        goto error;
-    }
-
-    if (pcap_compile(pcap_hdl, &bp, ctx->devi.bpf, 0, mask) == -1) {
-        pcap_perror(pcap_hdl, NULL);
-        goto error;
-    }
-
-    if (pcap_setfilter(pcap_hdl, &bp) == -1) {
-        pcap_perror(pcap_hdl, NULL);
-        goto error;
-    }
-
-    return 0;
-
-error:
-    if (pcap_hdl)
-        pcap_close(pcap_hdl);
-
-    ctx->devi.devatt.pcap_hdl = NULL;
-    return -1;
+    sig_exit = 1;
 }
 
 void frer_uninit(ctx_t *ctx)
 {
-    struct dev_out_st *elm;                                                          
+    struct dev_in_st *elmi;                                                          
+    struct dev_out_st *elmo;                                                          
                                                                                  
     if (!ctx)
         return;
 
-    if (ctx->devi.devatt.pcap_hdl)
-        pcap_close(ctx->devi.devatt.pcap_hdl);
+    SLIST_FOREACH(elmi, &ctx->devilh, le) {
+        if (elmi->pcap_hdl) {
+            pcap_close(elmi->pcap_hdl);
+            elmi->pcap_hdl = NULL;
+        }
+    }
 
-    SLIST_FOREACH(elm, &ctx->devolh, le) {
-        if (elm->devatt.pcap_hdl)
-            pcap_close(elm->devatt.pcap_hdl);
+    SLIST_FOREACH(elmo, &ctx->devolh, le) {
+        if (elmo->pcap_hdl) {
+            pcap_close(elmo->pcap_hdl);
+            elmo->pcap_hdl = NULL;
+        }
     }
 }
 
 int frer_init(ctx_t *ctx)
 {
-    struct dev_out_st *elm;
     char errbuf[PCAP_ERRBUF_SIZE];
+    bpf_u_int32 net, mask;
+    struct bpf_program bp;
+    struct dev_in_st *elmi;                                                          
+    struct dev_out_st *elmo;
 
     signal(SIGINT, sig_handler);
     signal(SIGTERM, sig_handler);
-    //signal(SIGHUP, sig_handler);
+    signal(SIGHUP, sig_handler);
 
-    if (frer_create_pcap_in(ctx) != -1)
-        goto error;
-
-    SLIST_FOREACH(elm, &ctx->devolh, le) {
-        elm->devatt.pcap_hdl = pcap_open_live(elm->devatt.dev, BUFSIZ, 0, TIMEOUT, errbuf);
-        if (!elm->devatt.pcap_hdl) {
+    SLIST_FOREACH(elmi, &ctx->devilh, le) {
+        elmi->pcap_hdl = pcap_open_live(elmi->dev, BUFSIZ, ctx->promisc, TIMEOUT, errbuf);
+        if (!elmi->pcap_hdl) {
             fprintf(stderr, "%s\n", errbuf);
             goto error;
         }
 
-        if (get_mac_address(elm->devatt.dev, elm->dest, elm->source) != 0) {
-            fprintf(stderr, "error: <if-%s> get mac\n", elm->devatt.dev);
+        if (pcap_setdirection(elmi->pcap_hdl, PCAP_D_IN) != 0) {
+            pcap_perror(elmi->pcap_hdl, NULL);
+            goto error;
+        }
+
+        if (!ctx->bpf)
+            continue;
+
+        if (pcap_lookupnet(elmi->dev, &net, &mask, errbuf) == -1) {
+            fprintf(stderr, "%s\n", errbuf);
+            goto error;
+        }
+
+        if (pcap_compile(elmi->pcap_hdl, &bp, ctx->bpf, 0, mask) == -1) {
+            pcap_perror(elmi->pcap_hdl, NULL);
+            goto error;
+        }
+
+        if (pcap_setfilter(elmi->pcap_hdl, &bp) == -1) {
+            pcap_perror(elmi->pcap_hdl, NULL);
+            goto error;
+        }
+    }
+
+    SLIST_FOREACH(elmo, &ctx->devolh, le) {
+        elmo->pcap_hdl = pcap_open_live(elmo->dev, BUFSIZ, 0, TIMEOUT, errbuf);
+        if (!elmo->pcap_hdl) {
+            fprintf(stderr, "%s\n", errbuf);
+            goto error;
+        }
+
+        if (get_mac_address(elmo->dev, elmo->dest, elmo->source) != 0) {
+            fprintf(stderr, "error: <if-%s> get mac\n", elmo->dev);
             goto error;
         }
     }
@@ -191,6 +290,9 @@ static int frer_encap(struct dev_out_st *elm, const void *data, int len, unsigne
     struct rtag_st rtag = {0, htons(sequence_number), 0};
     struct ethhdr eh;
     
+    if (len + FRER_HLEN > BUFSIZ)
+        return 0;
+
     memcpy(eh.h_dest, elm->dest, ETH_ALEN);
     memcpy(eh.h_source, elm->source, ETH_ALEN);
     eh.h_proto = htons(ETH_P_8021CB);
@@ -243,20 +345,24 @@ static void frer_talker(u_char *user, const struct pcap_pkthdr *h, const u_char 
     unsigned char buf[BUFSIZ];
     int buflen;
 
-#ifdef DEBUG
-    fprintf(stdout, "Recvd pkt: len(%d) %s\n\n", h->len, hexdump(bytes, 46));
-    fflush(stdout);
-#endif
+    if (ctx->debug) {
+        fprintf(stdout, "Captured: len(%d) %s\n\n", h->len, hexdump(bytes, 46));
+    }
 
-    ctx->devi.devatt.cnt += 1;
-    
     SLIST_FOREACH(elm, &ctx->devolh, le) {
         buflen = frer_encap(elm, bytes, h->len, buf);
-        if (pcap_sendpacket(elm->devatt.pcap_hdl, buf, buflen) != 0) {
-            pcap_perror(elm->devatt.pcap_hdl, NULL);
+        if (buflen == 0)
+            return;
+
+        if (ctx->debug) {
+            fprintf(stdout, "Sent: len(%d) %s\n\n", buflen, hexdump(buf, 46));
+        }
+
+        if (pcap_sendpacket(elm->pcap_hdl, buf, buflen) != 0) {
+            pcap_perror(elm->pcap_hdl, NULL);
             continue;
         }
-        elm->devatt.cnt += 1;
+        elm->cnt += 1;
     }
 
     sequence_number++;
@@ -269,45 +375,63 @@ static void frer_listener(u_char *user, const struct pcap_pkthdr *h, const u_cha
     unsigned char buf[BUFSIZ];
     int buflen;
 
-#ifdef DEBUG
-    fprintf(stdout, "Recvd pkt: len(%d) %s\n\n", h->len, hexdump(bytes, 46));
-    fflush(stdout);
-#endif
+    if (ctx->debug) {
+        fprintf(stdout, "Captured: len(%d) %s\n\n", h->len, hexdump(bytes, 46));
+    }
 
-    ctx->devi.devatt.cnt += 1;
+    //ctx->devi.cnt += 1;
 
     SLIST_FOREACH(elm, &ctx->devolh, le) {
         buflen = frer_decap(elm, bytes, h->len, buf);
         if (buflen == 0)
-            continue;
+            return;
 
-        if (pcap_sendpacket(elm->devatt.pcap_hdl, buf, buflen) != 0) {
-            pcap_perror(elm->devatt.pcap_hdl, NULL);
+        if (ctx->debug) {
+            fprintf(stdout, "Sent: len(%d) %s\n\n", buflen, hexdump(buf, 46));
+        }
+
+        if (pcap_sendpacket(elm->pcap_hdl, buf, buflen) != 0) {
+            pcap_perror(elm->pcap_hdl, NULL);
             continue;
         }
-        elm->devatt.cnt += 1;
+        elm->cnt += 1;
     }
 }
 
 void run(ctx_t *ctx)
 {
-    struct dev_out_st *elm;                                                          
+    struct dev_in_st *elmi;                                                          
+    struct dev_out_st *elmo;                                                          
+    struct pcap_pkthdr hdr;
+    const u_char *data;
 
     if (frer_init(ctx) != 0)
-        goto error;
+        return;
 
-    if (pcap_loop(ctx->devi.devatt.pcap_hdl, -1, ctx->callback, (u_char *)ctx) == -1) {
-        pcap_perror(ctx->devi.devatt.pcap_hdl, NULL);
-        goto error;
+    while (!sig_exit) {
+        SLIST_FOREACH(elmi, &ctx->devilh, le) {
+            if (sig_exit)
+                break;
+
+            data = pcap_next(elmi->pcap_hdl, &hdr);
+            if (!data) {
+                continue;
+            }
+            else {
+                elmi->cnt += 1;
+                ctx->callback((u_char *)ctx, &hdr, data);
+            }
+        }
     }
 
     fprintf(stdout, "\n");
-    fprintf(stdout, "%s ingress %d packets captured\n", ctx->devi.devatt.dev, ctx->devi.devatt.cnt);
-    SLIST_FOREACH(elm, &ctx->devolh, le) {
-        fprintf(stdout, "%s egress %d packets sent\n", elm->devatt.dev, elm->devatt.cnt);
+    SLIST_FOREACH(elmi, &ctx->devilh, le) {
+        fprintf(stdout, "%s in %d packets captured\n", elmi->dev, elmi->cnt);
+    }
+    SLIST_FOREACH(elmo, &ctx->devolh, le) {
+        fprintf(stdout, "%s out %d packets sent\n", elmo->dev, elmo->cnt);
     }
 
-error:
     frer_uninit(ctx);
 }
 
@@ -323,16 +447,16 @@ static ctx_t *new_ctx(void)
 
 static void usage(const char *bin)
 {
-    fprintf(stderr, "version 0.0.1, %s %s\n", __DATE__, __TIME__);
-    fprintf(stderr, "\n");
-    fprintf(stderr, "Usage: %s [-h] [-i <ingress device>] [-e <egress device>] [-f 'udp']\n", bin);
-    fprintf(stderr, "e.g.   %s -t -i eth2 -e eth0 eth1 -f 'udp dst port 5201'", bin);
-    fprintf(stderr, "       %s -l -e eth2", bin);
+    fprintf(stderr, "version 0.1.0, %s %s\n", __DATE__, __TIME__);
+    fprintf(stderr, "Usage: %s [-t] [-l] [-i <device>] [-o <device>]\n"
+                    "              [-h] [-m] [-d] [-f <expression>] \n\n", bin);
+    fprintf(stderr, "Examples: %s -t -i eth0 -o eth1 eth2 -f 'udp dst port 5201'\n", bin);
+    fprintf(stderr, "          %s -l -i eth1 eth2 -o eth3 -f 'ether[12:2]=0xf1c1'\n", bin);
 }
 
 static int parse_arguments(ctx_t *ctx, int argc, char **argv)
 {
-    int op;
+    int op, i;
 
     while ((op = getopt_long(argc, argv, SHORTOPTS, longopts, NULL)) != -1) {
         switch (op) {
@@ -340,25 +464,41 @@ static int parse_arguments(ctx_t *ctx, int argc, char **argv)
             case 'l':
                 ctx->role = op;
                 break;
-            case 'i':
-                ctx->devi.devatt.dev = strdup(optarg);
+            case 'f':
+                ctx->bpf = strdup(optarg);
                 break;
-            case 'e': {
-                struct dev_out_st *elm = (struct dev_out_st *)malloc(sizeof(struct dev_out_st));
-                if (!elm) {
-                    fprintf(stderr, "error: malloc\n");
-                    exit(1);
-                }
+            case 'm':
+                ctx->promisc = 1;
+                break;
+            case 'd':
+                ctx->debug = 1;
+                break;
+            case 'i': {
+                for (i = optind - 1; i < argc && argv[i][0] != '-'; i++) {
+                    struct dev_in_st *elmi = (struct dev_in_st *)malloc(sizeof(struct dev_in_st));
+                    if (!elmi) {
+                        fprintf(stderr, "error: malloc\n");
+                        exit(1);
+                    }
 
-                for (int i = optind - 1; i < argc && argv[i][0] != '-'; i++) {
-                    elm->devatt.dev = strdup(argv[i]);
-                    SLIST_INSERT_HEAD(&ctx->devolh, elm, le);
+                    elmi->dev = strdup(argv[i]);
+                    SLIST_INSERT_HEAD(&ctx->devilh, elmi, le);
                 }
                 break;
             }
-            case 'f':
-                ctx->devi.bpf = strdup(optarg);
+            case 'e': {
+                for (i = optind - 1; i < argc && argv[i][0] != '-'; i++) {
+                    struct dev_out_st *elmo = (struct dev_out_st *)malloc(sizeof(struct dev_out_st));
+                    if (!elmo) {
+                        fprintf(stderr, "error: malloc\n");
+                        exit(1);
+                    }
+
+                    elmo->dev = strdup(argv[i]);
+                    SLIST_INSERT_HEAD(&ctx->devolh, elmo, le);
+                }
                 break;
+            }
             case 'h':
             default:
                 return -1;

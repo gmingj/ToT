@@ -4,15 +4,15 @@ BIN=frer
 SRC_PATH=.
 OBJ_PATH=obj
 IFLAGS=#-I./include
-CFLAGS=-c -Wall
+CFLAGS=-c -Wall -g
 LFLAGS=-lpcap
 
 SOURCES=$(foreach dir, $(SRC_PATH), $(wildcard $(dir)/*.c))
 OBJS=$(addprefix $(OBJ_PATH)/, $(patsubst %.c, %.o, $(notdir $(SOURCES))))
 VPATH=$(SRC_PATH) #$(LIB_SRC_PATH)
 
-ifeq ($(VER), 1)
-	CFLAGS+=-g -DDEBUG
+ifeq ($(DEBUG), 1)
+	CFLAGS+=-DDEBUG
 endif
 
 all:$(BIN)
