@@ -5,7 +5,7 @@ SRC_PATH=.
 OBJ_PATH=obj
 IFLAGS=#-I./include
 CFLAGS=-c -Wall -g
-LFLAGS=-lpcap
+LFLAGS=-lpcap -lpthread
 
 SOURCES=$(foreach dir, $(SRC_PATH), $(wildcard $(dir)/*.c))
 OBJS=$(addprefix $(OBJ_PATH)/, $(patsubst %.c, %.o, $(notdir $(SOURCES))))

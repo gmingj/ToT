@@ -8,6 +8,8 @@
 
 #include <pcap/pcap.h>
 #include <linux/if_ether.h>
+#include <pthread.h>
+
 
 #define SLIST_HEAD(name, type)						\
 struct name {								\
@@ -83,8 +85,20 @@ struct {								\
 #define FRER_HLEN 20
 #define ETH_P_8021CB 0xF1C1
 
-#define BITMAP_SET(POS) (bitmap[POS/8] |= 1 << (POS%8))
-#define BITMAP_RESET(POS) (bitmap[POS/8] &= ~(1 << (POS%8)))
+#define BITMAP_SET(POS) \
+    do { \
+        pthread_mutex_lock(&bm_mutex); \
+        bitmap[POS/8] |= 1 << (POS%8); \
+        pthread_mutex_unlock(&bm_mutex); \
+    } while (0)
+
+#define BITMAP_RESET(POS) \
+    do { \
+        pthread_mutex_lock(&bm_mutex); \
+        bitmap[POS/8] &= ~(1 << (POS%8)); \
+        pthread_mutex_unlock(&bm_mutex); \
+    } while (0)
+
 #define BITMAP_TEST(POS) ((bitmap[POS/8] >> (POS%8) & 0x01) == 1)
 
 #define SHORTOPTS "hdi:o:f:m:tl"
@@ -109,6 +123,7 @@ struct dev_in_st {
     char *dev;
     pcap_t *pcap_hdl;
     int cnt;
+    pthread_t thread;
 };
 
 typedef struct {
@@ -123,9 +138,15 @@ typedef struct {
 
 static ctx_t *ctx;
 static int sig_exit;
+
 static unsigned short sequence_number;
+static pthread_mutex_t sn_mutex;
+
 static unsigned char bitmap[64*1024/8];
-static unsigned short window_pos = 0;
+static pthread_mutex_t bm_mutex;
+
+static unsigned short window_pos;
+static pthread_mutex_t wp_mutex;
 
 #define SHORTOPTS "hdi:o:f:m:tl"
 static const struct option longopts[] = {
@@ -179,19 +200,28 @@ static void frer_recover_sequence(unsigned short pos)
 #define RCVSZ 8*1024
 #define WNDSZ 16*1024
 
+    pthread_mutex_lock(&wp_mutex);
+
     unsigned int current_pos = pos < window_pos ? pos + 64*1024 : pos;
 
     if ((current_pos - window_pos) > WNDSZ) {
+
+        pthread_mutex_lock(&bm_mutex);
         memset(&bitmap[window_pos/8], 0, RCVSZ/8);
+        pthread_mutex_unlock(&bm_mutex);
+
         window_pos += RCVSZ;
     }
+
+    pthread_mutex_unlock(&wp_mutex);
 }
 
-void sig_handler(int sig)
+void sig_handler(int signo)
 {
     struct dev_in_st *elmi;                                                          
 
     SLIST_FOREACH(elmi, &ctx->devilh, le) {
+        pthread_kill(elmi->thread, SIGUSR1);
         if (elmi->pcap_hdl)
             pcap_breakloop(elmi->pcap_hdl);
     }
@@ -230,9 +260,9 @@ int frer_init(ctx_t *ctx)
     struct dev_in_st *elmi;                                                          
     struct dev_out_st *elmo;
 
-    signal(SIGINT, sig_handler);
-    signal(SIGTERM, sig_handler);
-    signal(SIGHUP, sig_handler);
+    pthread_mutex_init(&sn_mutex, NULL);
+    pthread_mutex_init(&bm_mutex, NULL);
+    pthread_mutex_init(&wp_mutex, NULL);
 
     SLIST_FOREACH(elmi, &ctx->devilh, le) {
         elmi->pcap_hdl = pcap_open_live(elmi->dev, BUFSIZ, ctx->promisc, TIMEOUT, errbuf);
@@ -287,7 +317,10 @@ error:
 
 static int frer_encap(struct dev_out_st *elm, const void *data, int len, unsigned char *buf)
 {
+    pthread_mutex_lock(&sn_mutex);
     struct rtag_st rtag = {0, htons(sequence_number), 0};
+    pthread_mutex_unlock(&sn_mutex);
+
     struct ethhdr eh;
     
     if (len + FRER_HLEN > BUFSIZ)
@@ -305,13 +338,12 @@ static int frer_encap(struct dev_out_st *elm, const void *data, int len, unsigne
     return FRER_HLEN + len;
 }
 
-static int frer_decap(struct dev_out_st *elm, const void *data, int len, unsigned char *buf)
+static int frer_decap(ctx_t *ctx, const void *data, int len, unsigned char *buf)
 {
     int hlen, seqofs;
     struct ethhdr *eh;
     const unsigned char *bytes = (const unsigned char *)data;
 
-    //TODO: fileter dlt, set bpf
     eh = (struct ethhdr *)bytes;
     if (eh->h_proto == htons(ETH_P_8021Q)) {
         if (*((unsigned short *)&bytes[ETH_HLEN + 2]) != htons(ETH_P_8021CB))
@@ -328,8 +360,13 @@ static int frer_decap(struct dev_out_st *elm, const void *data, int len, unsigne
         return 0;
 
     unsigned short seq = ntohs(*((unsigned short *)&bytes[seqofs]));
-    if (BITMAP_TEST(seq))
+
+    pthread_mutex_lock(&bm_mutex);
+    if (BITMAP_TEST(seq)) {
+        pthread_mutex_unlock(&bm_mutex);
         return 0;
+    }
+    pthread_mutex_unlock(&bm_mutex);
     
     BITMAP_SET(seq);
     frer_recover_sequence(seq);
@@ -365,7 +402,9 @@ static void frer_talker(u_char *user, const struct pcap_pkthdr *h, const u_char 
         elm->cnt += 1;
     }
 
+    pthread_mutex_lock(&sn_mutex);
     sequence_number++;
+    pthread_mutex_unlock(&sn_mutex);
 }
 
 static void frer_listener(u_char *user, const struct pcap_pkthdr *h, const u_char *bytes)
@@ -379,13 +418,11 @@ static void frer_listener(u_char *user, const struct pcap_pkthdr *h, const u_cha
         fprintf(stdout, "Captured: len(%d) %s\n\n", h->len, hexdump(bytes, 46));
     }
 
-    //ctx->devi.cnt += 1;
+    buflen = frer_decap(ctx, bytes, h->len, buf);
+    if (buflen == 0)
+        return;
 
     SLIST_FOREACH(elm, &ctx->devolh, le) {
-        buflen = frer_decap(elm, bytes, h->len, buf);
-        if (buflen == 0)
-            return;
-
         if (ctx->debug) {
             fprintf(stdout, "Sent: len(%d) %s\n\n", buflen, hexdump(buf, 46));
         }
@@ -398,15 +435,24 @@ static void frer_listener(u_char *user, const struct pcap_pkthdr *h, const u_cha
     }
 }
 
-void run(ctx_t *ctx)
+void thread_catch_sig(int signo)
 {
     struct dev_in_st *elmi;                                                          
-    struct dev_out_st *elmo;                                                          
+
+    SLIST_FOREACH(elmi, &ctx->devilh, le) {
+        if (elmi->pcap_hdl)
+            pcap_breakloop(elmi->pcap_hdl);
+    }
+}
+
+#if 0
+static void *thread_start(void *ptr)
+{
+    struct dev_in_st *elmi;                                                          
     struct pcap_pkthdr hdr;
     const u_char *data;
 
-    if (frer_init(ctx) != 0)
-        return;
+    signal(SIGUSR1, thread_catch_sig);
 
     while (!sig_exit) {
         SLIST_FOREACH(elmi, &ctx->devilh, le) {
@@ -423,16 +469,31 @@ void run(ctx_t *ctx)
             }
         }
     }
+    pthread_exit(NULL);
+    return NULL;
+}
+#endif
 
-    fprintf(stdout, "\n");
-    SLIST_FOREACH(elmi, &ctx->devilh, le) {
-        fprintf(stdout, "%s in %d packets captured\n", elmi->dev, elmi->cnt);
-    }
-    SLIST_FOREACH(elmo, &ctx->devolh, le) {
-        fprintf(stdout, "%s out %d packets sent\n", elmo->dev, elmo->cnt);
-    }
+static void *thread_start(void *arg)
+{
+    struct dev_in_st *elmi = (struct dev_in_st *)arg; 
+    struct pcap_pkthdr hdr;
+    const u_char *data;
 
-    frer_uninit(ctx);
+    signal(SIGUSR1, thread_catch_sig);
+
+    while (!sig_exit) {
+        data = pcap_next(elmi->pcap_hdl, &hdr);
+        if (!data) {
+            continue;
+        }
+        else {
+            elmi->cnt += 1;
+            ctx->callback((u_char *)ctx, &hdr, data);
+        }
+    }
+    pthread_exit(NULL);
+    return NULL;
 }
 
 static ctx_t *new_ctx(void)
@@ -447,7 +508,7 @@ static ctx_t *new_ctx(void)
 
 static void usage(const char *bin)
 {
-    fprintf(stderr, "version 0.1.0, %s %s\n", __DATE__, __TIME__);
+    fprintf(stderr, "version 0.2.0, %s %s\n", __DATE__, __TIME__);
     fprintf(stderr, "Usage: %s [-t] [-l] [-i <device>] [-o <device>]\n"
                     "              [-h] [-m] [-d] [-f <expression>] \n\n", bin);
     fprintf(stderr, "Examples: %s -t -i eth0 -o eth1 eth2 -f 'udp dst port 5201'\n", bin);
@@ -510,6 +571,10 @@ static int parse_arguments(ctx_t *ctx, int argc, char **argv)
 
 int main(int argc, char *argv[])
 {
+    signal(SIGINT, sig_handler);
+    //signal(SIGTERM, sig_handler);
+    //signal(SIGHUP, sig_handler);
+
     ctx = new_ctx();
     if (!ctx) {
         fprintf(stderr, "error: new ctx\n");
@@ -532,7 +597,33 @@ int main(int argc, char *argv[])
         exit(1);
     }
 
-    run(ctx);
+    struct dev_in_st *elmi;                                                          
+    struct dev_out_st *elmo;                                                          
+
+    if (frer_init(ctx) != 0)
+        return -1;
+
+    SLIST_FOREACH(elmi, &ctx->devilh, le) {
+        if (pthread_create(&elmi->thread, NULL, thread_start, (void *)elmi) != 0) {
+            fprintf(stderr, "error: create thread\n");
+            frer_uninit(ctx);
+            return -1;
+        }
+    }
+
+    SLIST_FOREACH(elmi, &ctx->devilh, le) {
+        pthread_join(elmi->thread, NULL);
+    }
+
+    fprintf(stdout, "\n");
+    SLIST_FOREACH(elmi, &ctx->devilh, le) {
+        fprintf(stdout, "%s in %d packets captured\n", elmi->dev, elmi->cnt);
+    }
+    SLIST_FOREACH(elmo, &ctx->devolh, le) {
+        fprintf(stdout, "%s out %d packets sent\n", elmo->dev, elmo->cnt);
+    }
+
+    frer_uninit(ctx);
     return 0;
 }
 
