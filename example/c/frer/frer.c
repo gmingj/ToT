@@ -136,7 +136,13 @@ typedef struct {
     pcap_handler callback;
 } ctx_t;
 
-static ctx_t *ctx;
+typedef struct {
+    ctx_t *ctx;
+    struct dev_in_st *elmi;
+} thread_arg_t;
+
+static ctx_t *gctx;
+
 static int sig_exit;
 
 static unsigned short sequence_number;
@@ -161,15 +167,58 @@ static const struct option longopts[] = {
 	{ 0, 0, 0, 0 },
 };
 
+static pcap_t *create_pcap_hdl_in(char *dev, int promisc, char *bpf)
+{
+    char errbuf[PCAP_ERRBUF_SIZE];
+    struct bpf_program bp;
+    pcap_t *pcap_hdl;
+
+    pcap_hdl = pcap_open_live(dev, BUFSIZ, promisc, TIMEOUT, errbuf);
+    if (!pcap_hdl) {
+        fprintf(stderr, "%s\n", errbuf);
+        return NULL;
+    }
+
+    if (pcap_setdirection(pcap_hdl, PCAP_D_IN) != 0) {
+        pcap_perror(pcap_hdl, NULL);
+        goto error;
+    }
+
+    if (pcap_compile(pcap_hdl, &bp, bpf, 0, -1) == -1) {
+        pcap_perror(pcap_hdl, NULL);
+        goto error;
+    }
+
+    if (pcap_setfilter(pcap_hdl, &bp) == -1) {
+        pcap_perror(pcap_hdl, NULL);
+        goto error;
+    }
+
+    return pcap_hdl;
+
+error:
+    pcap_close(pcap_hdl);
+    return NULL;
+}
+
 static int get_mac_address(char *dev, unsigned char *dest, unsigned char *source)
 {
+#if 0
+    pcap_t *pcap_hdl;
+    pcap_hdl = create_pcap_hdl_in(dev, 0, "arp");
+
+    while (1) {
+    }
+#endif
+
+    
     unsigned char dmac1[ETH_ALEN] = {0x00,0x0c,0x29,0x9b,0x35,0x0d};
-    unsigned char dmac2[ETH_ALEN] = {0x00,0x0c,0x29,0x9b,0x35,0x17};
+    unsigned char dmac2[ETH_ALEN] = {0x00,0x0c,0x29,0x9b,0x35,0x21};
     unsigned char smac[ETH_ALEN] = {0x09, 0x08, 0x07, 0x06, 0x05, 0x04};
 
     if (strcmp(dev, "eth1") == 0)
         memcpy(dest, dmac1, ETH_ALEN);
-    if (strcmp(dev, "eth2") == 0)
+    if (strcmp(dev, "eth3") == 0)
         memcpy(dest, dmac2, ETH_ALEN);
     memcpy(source, smac, ETH_ALEN);
 
@@ -220,7 +269,7 @@ void sig_handler(int signo)
 {
     struct dev_in_st *elmi;                                                          
 
-    SLIST_FOREACH(elmi, &ctx->devilh, le) {
+    SLIST_FOREACH(elmi, &gctx->devilh, le) {
         pthread_kill(elmi->thread, SIGUSR1);
         if (elmi->pcap_hdl)
             pcap_breakloop(elmi->pcap_hdl);
@@ -255,8 +304,6 @@ void frer_uninit(ctx_t *ctx)
 int frer_init(ctx_t *ctx)
 {
     char errbuf[PCAP_ERRBUF_SIZE];
-    bpf_u_int32 net, mask;
-    struct bpf_program bp;
     struct dev_in_st *elmi;                                                          
     struct dev_out_st *elmo;
 
@@ -265,34 +312,9 @@ int frer_init(ctx_t *ctx)
     pthread_mutex_init(&wp_mutex, NULL);
 
     SLIST_FOREACH(elmi, &ctx->devilh, le) {
-        elmi->pcap_hdl = pcap_open_live(elmi->dev, BUFSIZ, ctx->promisc, TIMEOUT, errbuf);
-        if (!elmi->pcap_hdl) {
-            fprintf(stderr, "%s\n", errbuf);
+        elmi->pcap_hdl = create_pcap_hdl_in(elmi->dev, ctx->promisc, ctx->bpf);
+        if (!elmi->pcap_hdl)
             goto error;
-        }
-
-        if (pcap_setdirection(elmi->pcap_hdl, PCAP_D_IN) != 0) {
-            pcap_perror(elmi->pcap_hdl, NULL);
-            goto error;
-        }
-
-        if (!ctx->bpf)
-            continue;
-
-        if (pcap_lookupnet(elmi->dev, &net, &mask, errbuf) == -1) {
-            fprintf(stderr, "%s\n", errbuf);
-            goto error;
-        }
-
-        if (pcap_compile(elmi->pcap_hdl, &bp, ctx->bpf, 0, mask) == -1) {
-            pcap_perror(elmi->pcap_hdl, NULL);
-            goto error;
-        }
-
-        if (pcap_setfilter(elmi->pcap_hdl, &bp) == -1) {
-            pcap_perror(elmi->pcap_hdl, NULL);
-            goto error;
-        }
     }
 
     SLIST_FOREACH(elmo, &ctx->devolh, le) {
@@ -396,7 +418,9 @@ static void frer_talker(u_char *user, const struct pcap_pkthdr *h, const u_char 
         }
 
         if (pcap_sendpacket(elm->pcap_hdl, buf, buflen) != 0) {
-            pcap_perror(elm->pcap_hdl, NULL);
+            if (ctx->debug)
+                pcap_perror(elm->pcap_hdl, NULL);
+
             continue;
         }
         elm->cnt += 1;
@@ -428,7 +452,9 @@ static void frer_listener(u_char *user, const struct pcap_pkthdr *h, const u_cha
         }
 
         if (pcap_sendpacket(elm->pcap_hdl, buf, buflen) != 0) {
-            pcap_perror(elm->pcap_hdl, NULL);
+            if (ctx->debug)
+                pcap_perror(elm->pcap_hdl, NULL);
+
             continue;
         }
         elm->cnt += 1;
@@ -439,57 +465,28 @@ void thread_catch_sig(int signo)
 {
     struct dev_in_st *elmi;                                                          
 
-    SLIST_FOREACH(elmi, &ctx->devilh, le) {
+    SLIST_FOREACH(elmi, &gctx->devilh, le) {
         if (elmi->pcap_hdl)
             pcap_breakloop(elmi->pcap_hdl);
     }
 }
 
-#if 0
-static void *thread_start(void *ptr)
-{
-    struct dev_in_st *elmi;                                                          
-    struct pcap_pkthdr hdr;
-    const u_char *data;
-
-    signal(SIGUSR1, thread_catch_sig);
-
-    while (!sig_exit) {
-        SLIST_FOREACH(elmi, &ctx->devilh, le) {
-            if (sig_exit)
-                break;
-
-            data = pcap_next(elmi->pcap_hdl, &hdr);
-            if (!data) {
-                continue;
-            }
-            else {
-                elmi->cnt += 1;
-                ctx->callback((u_char *)ctx, &hdr, data);
-            }
-        }
-    }
-    pthread_exit(NULL);
-    return NULL;
-}
-#endif
-
 static void *thread_start(void *arg)
 {
-    struct dev_in_st *elmi = (struct dev_in_st *)arg; 
+    thread_arg_t *tharg = (thread_arg_t *)arg;
     struct pcap_pkthdr hdr;
     const u_char *data;
 
     signal(SIGUSR1, thread_catch_sig);
 
     while (!sig_exit) {
-        data = pcap_next(elmi->pcap_hdl, &hdr);
+        data = pcap_next(tharg->elmi->pcap_hdl, &hdr);
         if (!data) {
             continue;
         }
         else {
-            elmi->cnt += 1;
-            ctx->callback((u_char *)ctx, &hdr, data);
+            tharg->elmi->cnt += 1;
+            tharg->ctx->callback((u_char *)tharg->ctx, &hdr, data);
         }
     }
     pthread_exit(NULL);
@@ -571,15 +568,17 @@ static int parse_arguments(ctx_t *ctx, int argc, char **argv)
 
 int main(int argc, char *argv[])
 {
-    signal(SIGINT, sig_handler);
-    //signal(SIGTERM, sig_handler);
-    //signal(SIGHUP, sig_handler);
+    ctx_t *ctx;
+    struct dev_in_st *elmi;
+    struct dev_out_st *elmo;
+    thread_arg_t *tharg;
 
     ctx = new_ctx();
     if (!ctx) {
         fprintf(stderr, "error: new ctx\n");
         return -1;
     }
+    gctx = ctx; // for signal handler
 
     if (parse_arguments(ctx, argc, argv) < 0) {
         usage(argv[0]);
@@ -597,14 +596,25 @@ int main(int argc, char *argv[])
         exit(1);
     }
 
-    struct dev_in_st *elmi;                                                          
-    struct dev_out_st *elmo;                                                          
-
     if (frer_init(ctx) != 0)
         return -1;
 
+    signal(SIGINT, sig_handler);
+    signal(SIGTERM, sig_handler);
+    signal(SIGHUP, sig_handler);
+
     SLIST_FOREACH(elmi, &ctx->devilh, le) {
-        if (pthread_create(&elmi->thread, NULL, thread_start, (void *)elmi) != 0) {
+        tharg = (thread_arg_t *)malloc(sizeof(thread_arg_t));
+        if (!tharg) {
+            fprintf(stderr, "error: malloc\n");
+            frer_uninit(ctx);
+            return -1;
+        }
+
+        tharg->ctx = ctx;
+        tharg->elmi = elmi;
+
+        if (pthread_create(&elmi->thread, NULL, thread_start, (void *)tharg) != 0) {
             fprintf(stderr, "error: create thread\n");
             frer_uninit(ctx);
             return -1;
