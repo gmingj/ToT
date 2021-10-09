@@ -8,7 +8,10 @@
 
 #include <pcap/pcap.h>
 #include <linux/if_ether.h>
+#include <linux/if_arp.h>
 #include <pthread.h>
+
+#include <sys/ioctl.h>
 
 
 #define SLIST_HEAD(name, type)						\
@@ -201,27 +204,51 @@ error:
     return NULL;
 }
 
-static int get_mac_address(char *dev, unsigned char *dest, unsigned char *source)
+static int get_dest_mac(char *dev, unsigned char *mac)
 {
-#if 0
     pcap_t *pcap_hdl;
-    pcap_hdl = create_pcap_hdl_in(dev, 0, "arp");
+    struct pcap_pkthdr hdr;
+    const u_char *data;
+
+    pcap_hdl = create_pcap_hdl_in(dev, 1, "arp[14:4]=0 and arp[24:4]=0");
+    if (!pcap_hdl)
+        return -1;
 
     while (1) {
+        data = pcap_next(pcap_hdl, &hdr);
+        if (data) {
+            memcpy(mac, &data[22], ETH_ALEN);
+            break;
+        }
     }
-#endif
 
-    
-    unsigned char dmac1[ETH_ALEN] = {0x00,0x0c,0x29,0x9b,0x35,0x0d};
-    unsigned char dmac2[ETH_ALEN] = {0x00,0x0c,0x29,0x9b,0x35,0x21};
-    unsigned char smac[ETH_ALEN] = {0x09, 0x08, 0x07, 0x06, 0x05, 0x04};
+    pcap_close(pcap_hdl);
+    return 0;
+}
 
-    if (strcmp(dev, "eth1") == 0)
-        memcpy(dest, dmac1, ETH_ALEN);
-    if (strcmp(dev, "eth3") == 0)
-        memcpy(dest, dmac2, ETH_ALEN);
-    memcpy(source, smac, ETH_ALEN);
+static int get_source_mac(char *dev, unsigned char *mac)
+{
+    int fd;
+    struct ifreq ifr;
 
+    fd = socket(AF_INET, SOCK_DGRAM, 0);
+    if (fd < 0) {
+        fprintf(stderr, "%s\n", strerror(errno));
+        return -1;
+    }
+
+    memset(&ifr, 0, sizeof(ifr));
+    strncpy(ifr.ifr_name, dev, sizeof(ifr.ifr_name) - 1);
+    ifr.ifr_name[sizeof(ifr.ifr_name) - 1] = '\0';
+
+    if (ioctl(fd, SIOCGIFHWADDR, &ifr) < 0) {
+        close(fd);
+        fprintf(stderr, "%s\n", strerror(errno));
+        return -1;
+    }
+
+    close(fd);
+    memcpy(mac, &ifr.ifr_hwaddr.sa_data, ETH_ALEN);
     return 0;
 }
 
@@ -301,6 +328,78 @@ void frer_uninit(ctx_t *ctx)
     }
 }
 
+static int encap_arpreq(char *dev, unsigned char *buf)
+{
+    unsigned char smac[ETH_ALEN];
+    struct ethhdr eh;
+    struct arphdr ah;
+    int offset;
+
+    if (get_source_mac(dev, smac) != 0) {
+        fprintf(stderr, "error: <if-%s> get source mac\n", dev);
+        return -1;
+    }
+
+    memset(eh.h_dest, 0xff, ETH_ALEN);
+    memcpy(eh.h_source, smac, ETH_ALEN);
+    eh.h_proto = htons(ETH_P_ARP);
+
+    memset(&ah, 0, sizeof(struct arphdr));
+    ah.ar_hrd = htons(ARPHRD_ETHER);
+    ah.ar_pro = htons(ETH_P_IP);
+    ah.ar_hln = 6;
+    ah.ar_pln = 4;
+    ah.ar_op = htons(ARPOP_REQUEST);  
+
+    memcpy(buf, &eh, ETH_HLEN);
+    memcpy(buf + ETH_HLEN, &ah, sizeof(struct arphdr));
+
+    offset = ETH_HLEN + sizeof(struct arphdr);
+    memcpy(buf + offset, eh.h_source, ETH_ALEN);
+
+    offset += ETH_ALEN;
+    memset(buf + offset, 0, 4);
+
+    offset += 4;
+    memcpy(buf + offset, eh.h_dest, ETH_ALEN);
+
+    offset += ETH_ALEN;
+    memset(buf + offset, 0, 4);
+
+    return ETH_HLEN + 28;
+}
+
+static int notice_self_mac(ctx_t *ctx, char *dev)
+{
+    unsigned char buf[BUFSIZ];
+    char errbuf[PCAP_ERRBUF_SIZE];
+    pcap_t *pcap_hdl;
+    int buflen, try = 2;
+
+    if ((buflen = encap_arpreq(dev, buf)) < 0)
+        return -1;
+
+    pcap_hdl = pcap_open_live(dev, BUFSIZ, 0, TIMEOUT, errbuf);
+    if (!pcap_hdl) {
+        fprintf(stderr, "%s\n", errbuf);
+        return -1;
+    }
+
+    while (try-- > 0) {
+        if (pcap_sendpacket(pcap_hdl, buf, buflen) != 0) {
+            pcap_perror(pcap_hdl, NULL);
+            return -1;
+        }
+        sleep(1);
+    }
+
+    if (ctx->debug)
+        fprintf(stdout, "notice mac: len(%d) %s\n", buflen, hexdump(buf, buflen));
+
+    pcap_close(pcap_hdl);
+    return 0;
+}
+
 int frer_init(ctx_t *ctx)
 {
     char errbuf[PCAP_ERRBUF_SIZE];
@@ -311,11 +410,21 @@ int frer_init(ctx_t *ctx)
     pthread_mutex_init(&bm_mutex, NULL);
     pthread_mutex_init(&wp_mutex, NULL);
 
+    fprintf(stdout, "listening on");
+
     SLIST_FOREACH(elmi, &ctx->devilh, le) {
         elmi->pcap_hdl = create_pcap_hdl_in(elmi->dev, ctx->promisc, ctx->bpf);
         if (!elmi->pcap_hdl)
             goto error;
+
+        if (ctx->role == 'l')
+            notice_self_mac(ctx, elmi->dev);
+
+        fprintf(stdout, " %s", elmi->dev);
     }
+
+    fprintf(stdout, "\n");
+    fprintf(stdout, "sending on");
 
     SLIST_FOREACH(elmo, &ctx->devolh, le) {
         elmo->pcap_hdl = pcap_open_live(elmo->dev, BUFSIZ, 0, TIMEOUT, errbuf);
@@ -324,12 +433,29 @@ int frer_init(ctx_t *ctx)
             goto error;
         }
 
-        if (get_mac_address(elmo->dev, elmo->dest, elmo->source) != 0) {
-            fprintf(stderr, "error: <if-%s> get mac\n", elmo->dev);
+        fprintf(stdout, " %s", elmo->dev);
+
+        if (ctx->role != 't')
+            continue;
+
+        if (get_dest_mac(elmo->dev, elmo->dest) != 0) {
+            fprintf(stderr, "error: <if-%s> get dest mac\n", elmo->dev);
             goto error;
         }
+
+        fprintf(stdout, " %.2x:%.2x:%.2x:%.2x:%.2x:%.2x", elmo->dest[0], elmo->dest[1], elmo->dest[2],
+                elmo->dest[3], elmo->dest[4], elmo->dest[5]);
+
+        if (get_source_mac(elmo->dev, elmo->source) != 0) {
+            fprintf(stderr, "error: <if-%s> get source mac\n", elmo->dev);
+            goto error;
+        }
+
+        fprintf(stdout, " %.2x:%.2x:%.2x:%.2x:%.2x:%.2x  ", elmo->source[0], elmo->source[1], elmo->source[2],
+                elmo->source[3], elmo->source[4], elmo->source[5]);
     }
 
+    fprintf(stdout, "\n");
     return 0;
 
 error:
@@ -505,7 +631,7 @@ static ctx_t *new_ctx(void)
 
 static void usage(const char *bin)
 {
-    fprintf(stderr, "version 0.2.0, %s %s\n", __DATE__, __TIME__);
+    fprintf(stderr, "version 0.4.0, %s %s\n", __DATE__, __TIME__);
     fprintf(stderr, "Usage: %s [-t] [-l] [-i <device>] [-o <device>]\n"
                     "              [-h] [-m] [-d] [-f <expression>] \n\n", bin);
     fprintf(stderr, "Examples: %s -t -i eth0 -o eth1 eth2 -f 'udp dst port 5201'\n", bin);
