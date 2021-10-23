@@ -1,17 +1,28 @@
+
+#CROSS_COMPILE=/opt/gcc-arm-9.2-2019.12-x86_64-aarch64-none-linux-gnu/bin/aarch64-none-linux-gnu-
+
 CC=$(CROSS_COMPILE)gcc
+
+ifdef CROSS_COMPILE
+	ARCH=arm
+else
+	ARCH=x86
+endif
 
 BIN=frer
 SRC_PATH=.
 OBJ_PATH=obj
-IFLAGS=#-I./include
+LIB_PATH=lib/$(ARCH)
+INC_PATH=include
+IFLAGS=-I$(INC_PATH)
 CFLAGS=-c -Wall -g
-LFLAGS=-lpcap -lpthread
+LFLAGS=-L$(LIB_PATH) -lpcap -lpthread
 
 SOURCES=$(foreach dir, $(SRC_PATH), $(wildcard $(dir)/*.c))
 OBJS=$(addprefix $(OBJ_PATH)/, $(patsubst %.c, %.o, $(notdir $(SOURCES))))
 VPATH=$(SRC_PATH) #$(LIB_SRC_PATH)
 
-ifeq ($(DEBUG), 1)
+ifeq ($(DEBUG), y)
 	CFLAGS+=-DDEBUG
 endif
 
