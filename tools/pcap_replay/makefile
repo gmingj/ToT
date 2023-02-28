@@ -1,18 +1,19 @@
-CC=$(CROSS_COMPILE)gcc
+CC=gcc
 
-BIN=icap
+BIN=pcap_replay
 SRC_PATH=.
 OBJ_PATH=obj
-IFLAGS=#-I./include
-CFLAGS=-c -Wall
-LFLAGS=-lpcap
+LIB_PATH=lib/$(ARCH)
+IFLAGS= #-I./include
+CFLAGS=-c -Wall -g
+LFLAGS=-lpcap # -L$(LIB_PATH)
 
 SOURCES=$(foreach dir, $(SRC_PATH), $(wildcard $(dir)/*.c))
 OBJS=$(addprefix $(OBJ_PATH)/, $(patsubst %.c, %.o, $(notdir $(SOURCES))))
 VPATH=$(SRC_PATH) #$(LIB_SRC_PATH)
 
-ifeq ($(VER), 1)
-	CFLAGS+=-g -DDEBUG
+ifeq ($(DEBUG), 1)
+	CFLAGS+=-DDEBUG
 endif
 
 all:$(BIN)

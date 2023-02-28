@@ -1,0 +1,1 @@
+./pcapreplay -f ../../../gptp_master.pcap -o eth2 -F 'ether[14:1]&0xf=0'
