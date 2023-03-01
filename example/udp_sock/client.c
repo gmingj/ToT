@@ -8,6 +8,9 @@
 #include <arpa/inet.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
+#include <errno.h>
+#include <sys/types.h>
+#include <sys/socket.h>
 
 #define MAX(a,b) (((a) > (b)) ? (a) : (b))
 #define MIN(a,b) (((a) < (b)) ? (a) : (b))
@@ -45,10 +48,11 @@ static void dispaly_latency_cnt(void)
 int main(int argc, char *argv[])
 {
 	int sockfd;
-	struct sockaddr_in servaddr;
+	struct sockaddr_in servaddr, addr;
     time_t start_tm = time(NULL);
+	socklen_t servlen = sizeof(struct sockaddr), addrlen = sizeof(struct sockaddr);
 
-    sockfd = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    sockfd = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
     if (sockfd == -1) {
         perror("socket");
         exit(1);
@@ -57,16 +61,7 @@ int main(int argc, char *argv[])
 	bzero(&servaddr, sizeof(servaddr));
     servaddr.sin_family = AF_INET;
     servaddr.sin_port = htons(1234);
-	if (inet_pton(AF_INET, argv[1], &servaddr.sin_addr) < 0) {
-		printf("inet_pton error for %s\n", argv[1]);
-		exit(1);
-	}
-
-    if (connect(sockfd, (struct sockaddr *)&servaddr, sizeof(servaddr)) < 0) {
-        perror("connect");
-        exit(1);
-    }
-    printf("connected\n");
+    servaddr.sin_addr.s_addr = inet_addr(argv[1]);
 
     int total_latency = 0;
     int min_latency = INT_MAX;
@@ -79,32 +74,44 @@ int main(int argc, char *argv[])
     int ret;
     int latency;
 
+    /* for tc */
+    struct timeval tv = {0, 200000};
+    setsockopt(sockfd, SOL_SOCKET, SO_RCVTIMEO,
+            (char *)&tv, sizeof(struct timeval));
+
     while (packets_received < TOTAL_PKT_NUM) {
 
         clock_gettime(CLOCK_MONOTONIC, &ts);
         timestamp_s = ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
         memcpy(buff, &timestamp_s, sizeof(timestamp_s));
 
-        ret = send(sockfd, buff, 100, 0);
+        ret = sendto(sockfd, buff, 100, 0,
+                (struct sockaddr *)&servaddr, servlen);
         if (ret != 100) {
-            perror("send");
+            perror("sendto");
             exit(1);
         }
         packets_sent++;
 
-        ret = recv(sockfd, buff, BUFF_SIZE, 0);
+resend:
+        ret = recvfrom(sockfd, buff, BUFF_SIZE, 0,
+                (struct sockaddr *)&addr, &addrlen);
+        if (ret == -1 && errno == EAGAIN) {
+            continue;
+        }
         if (ret == -1) {
-            perror("recv");
+            perror("recvfrom");
             exit(1);
         }
 
         memcpy(&timestamp_r, buff, sizeof(timestamp_r));
-        printf("recv: timestamp_r %lld, rcvd_len %d\n", timestamp_r, ret);
 
         if (memcmp(&timestamp_s, &timestamp_r, sizeof(unsigned long long)) != 0) {
-            printf("[WARNING] pkt not match !\n");
-            exit(1);
+            //printf("[WARNING] pkt not match !\n");
+            goto resend;
         }
+        
+        printf("recv: timestamp_r %lld, rcvd_len %d\n", timestamp_r, ret);
 
         clock_gettime(CLOCK_MONOTONIC, &ts);
         ts_now = ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
@@ -124,7 +131,7 @@ int main(int argc, char *argv[])
     printf("Min latency: %d ms\n", min_latency);
     printf("Max latency: %d ms\n", max_latency);
     dispaly_latency_cnt();
-    
+
     close(sockfd);
     return 0;
 }
