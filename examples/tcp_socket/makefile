@@ -1,12 +1,17 @@
 
-all:tcpclient tcpserver
+CFLAGS=-g -Wall
+BUILD_PATH=build
 
-tcpserver:server.c
-	$(CC) $^ -o $@
+all:$(BUILD_PATH)/tcpclient $(BUILD_PATH)/tcpserver
 
-tcpclient:client.c
-	$(CC) $^ -o $@
+$(BUILD_PATH)/tcpserver:server.c
+	@if [ ! -d $(BUILD_PATH) ]; then mkdir -p $(BUILD_PATH); fi;
+	$(CC) $(CFLAGS) $^ -o $@
+
+$(BUILD_PATH)/tcpclient:client.c
+	@if [ ! -d $(BUILD_PATH) ]; then mkdir -p $(BUILD_PATH); fi;
+	$(CC) $(CFLAGS) $^ -o $@
 
 .PHONY:
 clean:
-	-rm -f *.o tcpclient tcpserver
+	-rm -rf $(BUILD_PATH)

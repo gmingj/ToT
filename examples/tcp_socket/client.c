@@ -13,12 +13,40 @@
 #define MIN(a,b) (((a) < (b)) ? (a) : (b))
 
 #define BUFF_SIZE 500
+#define TOTAL_PKT_NUM 500
+
+typedef struct {
+	int max;
+	int sum;
+} latency_count_t;
+
+latency_count_t lc[] = {
+	{250},{300},{350},{400},{450},{500},{550},{600},{650},{700},{750},{800},{850},{900},{950},{1000}
+};
+
+static void count_latency(int latency)
+{
+    int i;
+    for (i = 0; i < sizeof(lc)/sizeof(lc[0]); i++) {
+        if (latency <= lc[i].max)
+            lc[i].sum += 1;
+    }
+}
+
+static void dispaly_latency_cnt(void)
+{
+    int i;
+    for (i = 0; i < sizeof(lc)/sizeof(lc[0]); i++) {
+        printf("%d ", lc[i].sum * 100 / TOTAL_PKT_NUM);
+    }
+    printf("\n");
+}
 
 int main(int argc, char *argv[])
 {
 	int sockfd;
 	struct sockaddr_in servaddr;
-    int test_duration = atoi(argv[2]);
+    time_t start_tm = time(NULL);
 
     sockfd = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
     if (sockfd == -1) {
@@ -40,7 +68,6 @@ int main(int argc, char *argv[])
     }
     printf("connected\n");
 
-    int start_time = time(NULL);
     int total_latency = 0;
     int min_latency = INT_MAX;
     int max_latency = 0;
@@ -52,10 +79,10 @@ int main(int argc, char *argv[])
     int ret;
     int latency;
 
-    while (time(NULL) < start_time + test_duration) {
+    while (packets_received < TOTAL_PKT_NUM) {
 
         clock_gettime(CLOCK_MONOTONIC, &ts);
-        timestamp_s = ts.tv_sec * 1000000 + ts.tv_nsec / 1000;
+        timestamp_s = ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
         memcpy(buff, &timestamp_s, sizeof(timestamp_s));
 
         ret = send(sockfd, buff, 100, 0);
@@ -80,8 +107,10 @@ int main(int argc, char *argv[])
         }
 
         clock_gettime(CLOCK_MONOTONIC, &ts);
-        ts_now = ts.tv_sec * 1000000 + ts.tv_nsec / 1000;
+        ts_now = ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
         latency = ts_now - timestamp_s;
+        count_latency(latency);
+
         total_latency += latency;
         min_latency = MIN(min_latency, latency);
         max_latency = MAX(max_latency, latency);
@@ -89,10 +118,12 @@ int main(int argc, char *argv[])
     }
 
     printf("\n");
+    printf("Total time %ld s\n", time(NULL) - start_tm);
     printf("Total Rx/Tx: %d/%d\n", packets_received, packets_sent);
-    printf("Average latency: %d us\n", total_latency / packets_received);
-    printf("Min latency: %d us\n", min_latency);
-    printf("Max latency: %d us\n", max_latency);
+    printf("Average latency: %d ms\n", total_latency / packets_received);
+    printf("Min latency: %d ms\n", min_latency);
+    printf("Max latency: %d ms\n", max_latency);
+    dispaly_latency_cnt();
     
     close(sockfd);
     return 0;
