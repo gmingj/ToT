@@ -7,6 +7,7 @@
 #include <sys/socket.h>
 #include <netinet/in.h>
 
+#define PKT_SIZE 100
 #define BUFF_SIZE 500
 
 int main(int argc, char *argv[])
@@ -58,13 +59,17 @@ int main(int argc, char *argv[])
             printf("peer closed\n");
             exit(0);
         }
+        if (ret != 100) {
+            printf("pkt len not match\n");
+            exit(0);
+        }
         packets_received++;
 
         memcpy(&timestamp, buff, sizeof(timestamp));
         printf("recv: timestamp %lld, rcvd_len %d, total rcvd pkt %d\n", timestamp, ret, packets_received);
 
-        ret = send(connfd, buff, 100, 0);
-        if (ret != 100) {
+        ret = send(connfd, buff, PKT_SIZE, 0);
+        if (ret != PKT_SIZE) {
             perror("send");
             exit(1);
         }
