@@ -17,6 +17,7 @@
 #define PKT_SIZE 100
 #define BUFF_SIZE 500
 
+#if 0
 typedef struct {
 	int max;
 	int sum;
@@ -43,6 +44,7 @@ static void dispaly_latency_cnt(int total)
     }
     printf("\n");
 }
+#endif
 
 /*
  * ms: scale = 1000
@@ -64,7 +66,6 @@ int main(int argc, char *argv[])
 {
     int sockfd;
     struct sockaddr_in servaddr, addr;
-    time_t start_tm = time(NULL);
     socklen_t servlen = sizeof(struct sockaddr), addrlen = sizeof(struct sockaddr);
     int total_pkt = atoi(argv[2]);
 
@@ -89,7 +90,6 @@ int main(int argc, char *argv[])
     int ret;
     int latency;
     unsigned int index_s = 0, index_r;
-    static long long dbg_max, dbg_min;
 
     /*
      * Set the timeout period of 1 seconds, if the value is too small,
@@ -101,25 +101,22 @@ int main(int argc, char *argv[])
     setsockopt(sockfd, SOL_SOCKET, SO_RCVTIMEO,
             (char *)&tv, sizeof(struct timeval));
 
+    time_t start_tm = get_timestamp(1000);
     while (packets_sent < total_pkt) {
 
-        timestamp_s = get_timestamp(1000);
+        timestamp_s = get_timestamp(1);
         memcpy(buff, &timestamp_s, sizeof(timestamp_s));
         memcpy(buff + sizeof(timestamp_s), &index_s, sizeof(index_s));
 
-        unsigned long long dbg_ts = get_timestamp(1);
         ret = sendto(sockfd, buff, PKT_SIZE, 0,
                 (struct sockaddr *)&servaddr, servlen);
         if (ret != PKT_SIZE) {
             perror("sendto");
             exit(1);
         }
-        unsigned long long dbg_diff = get_timestamp(1) - dbg_ts;
-        dbg_max = dbg_diff > dbg_max ? dbg_diff : dbg_max;
-        dbg_min = dbg_diff < dbg_max ? dbg_diff : dbg_max;
         packets_sent++;
-        printf("send: pkt %d timestamp %lld, rcvd_len %d, total sent pkt %d\n",
-                index_s, timestamp_s, ret, packets_sent);
+        //printf("send: pkt %d timestamp %lld, rcvd_len %d, total sent pkt %d\n",
+        //        index_s, timestamp_s, ret, packets_sent);
         index_s++;
 
         ret = recvfrom(sockfd, buff, BUFF_SIZE, 0,
@@ -137,29 +134,33 @@ int main(int argc, char *argv[])
         }
 
         packets_received++;
-        printf("recv: pkt %d timestamp %lld, rcvd_len %d, total rcvd pkt %d\n", index_r, timestamp_r, ret, packets_received);
+        //printf("recv: pkt %d timestamp %lld, rcvd_len %d, total rcvd pkt %d\n", index_r, timestamp_r, ret, packets_received);
 
-        ts_now = get_timestamp(1000);
+        ts_now = get_timestamp(1);
         latency = ts_now - timestamp_s;
-        count_latency(latency);
+        printf("%.3f ", (double)latency / 1000);
+        //count_latency(latency);
 
         total_latency += latency;
         min_latency = MIN(min_latency, latency);
         max_latency = MAX(max_latency, latency);
 
-        usleep(20000);
+        //usleep(20000);
     }
 
     printf("\n");
-    printf("Build at %s %s\n", __DATE__, __TIME__);
-    //printf("Packet sent rate %.2f kbps\n", (double)(packets_sent * PKT_SIZE * 8) / (time(NULL) - start_tm) / 1000);
-    printf("Total time %ld s\n", time(NULL) - start_tm);
-    printf("Total Rx/Tx: %d/%d\n", packets_received, packets_sent);
-    printf("Average latency: %d ms\n", total_latency / packets_received);
-    printf("Min latency: %d ms\n", min_latency);
-    printf("Max latency: %d ms\n", max_latency);
-    printf("Send max %lld min %lld\n", dbg_max, dbg_min);
-    dispaly_latency_cnt(total_pkt);
+    printf("--- statistics ---\n");
+    double elapsed_time = (double)(get_timestamp(1000) - start_tm) / 1000;
+    printf("%d packets transmitted, %d received, %d packet loss, time %.3f s\n",
+            packets_sent,
+            packets_received,
+            packets_sent - packets_received,
+            elapsed_time);
+    printf("rtt min/avg/max = %.3f/%.3f/%.3f ms\n",
+            (double)min_latency / 1000,
+            (double)total_latency / packets_received / 1000,
+            (double)max_latency / 1000);
+    printf("throughout %.3f bps\n", (double)((packets_sent + packets_received) * 8) / elapsed_time);
 
     close(sockfd);
     return 0;

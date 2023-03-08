@@ -46,6 +46,7 @@ static int udp_output_cb(const char *buf, int len, ikcpcb *kcp, void *user)
 	return ret;
 }
 
+#if 1
 static void set_nonblock(int sockfd)
 {
     int flag = fcntl(sockfd, F_GETFL, 0);
@@ -58,8 +59,8 @@ static void set_nonblock(int sockfd)
         perror("fcntl");
         exit(1);
     }
-
 }
+#endif
 
 int main(int argc, char *argv[])
 {
@@ -101,7 +102,7 @@ int main(int argc, char *argv[])
 
     int on = 1;
     setsockopt(clifd, SOL_SOCKET, SO_REUSEADDR, &on, sizeof(on));
-    //set_nonblock(clifd);
+    set_nonblock(clifd);
 
     /* ikcp init */
     user_data_t data = {clifd, (struct sockaddr *)&cliaddr};
@@ -116,13 +117,11 @@ int main(int argc, char *argv[])
 
         ikcp_update(kcp, get_timestamp(1000));
 
-        printf("ready to recvfrom\n");
         ret = recvfrom(clifd, buff, BUFF_SIZE, 0,
                 (struct sockaddr *)&cliaddr, &clilen);
         if (ret < 0)
             continue;
 
-        printf("ready to ikcp_recv\n");
         ikcp_input(kcp, buff, ret);
         ret = ikcp_recv(kcp, buff, BUFF_SIZE);
         if (ret < 0)
